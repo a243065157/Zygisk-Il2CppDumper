@@ -12,8 +12,10 @@
 #include <fcntl.h>
 #include <set>
 #include <string>
+#include <sys/syscall.h>
 #include <thread>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <vector>
 
@@ -21,7 +23,6 @@ namespace {
 
 constexpr const char *kOutRoot = "/sdcard/Download/unified_dump";
 constexpr const char *kMapsPath = "/proc/self/maps";
-constexpr const char *kMemPath = "/proc/self/mem";
 constexpr const char *kTargetSo = "libil2cpp.so";
 constexpr int kMaxWaitSec = 45;
 constexpr size_t kChunkSize = 0x20000;
@@ -153,7 +154,19 @@ static std::string seg_label(const MapEntry &e) {
     return std::string(buf);
 }
 
-static bool dump_segment_via_proc_mem(int mem_fd, const MapEntry &seg, const std::string &out_path, uint64_t &read_ok, uint64_t &read_fail) {
+static ssize_t read_self_vm(uint64_t remote_addr, void *buf, size_t len) {
+    iovec local_iov{};
+    local_iov.iov_base = buf;
+    local_iov.iov_len = len;
+
+    iovec remote_iov{};
+    remote_iov.iov_base = reinterpret_cast<void *>(remote_addr);
+    remote_iov.iov_len = len;
+
+    return syscall(__NR_process_vm_readv, getpid(), &local_iov, 1, &remote_iov, 1, 0);
+}
+
+static bool dump_segment_via_vmread(const MapEntry &seg, const std::string &out_path, uint64_t &read_ok, uint64_t &read_fail) {
     int out_fd = open(out_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0664);
     if (out_fd < 0) return false;
 
@@ -164,7 +177,7 @@ static bool dump_segment_via_proc_mem(int mem_fd, const MapEntry &seg, const std
 
     while (cur < seg.end) {
         size_t want = (size_t) std::min<uint64_t>(kChunkSize, seg.end - cur);
-        ssize_t got = pread(mem_fd, buf.data(), want, (off_t) cur);
+        ssize_t got = read_self_vm(cur, buf.data(), want);
         if (got > 0) {
             ssize_t wr = write(out_fd, buf.data(), (size_t) got);
             if (wr != got) {
@@ -288,14 +301,6 @@ static void run_unified_capture() {
                      e.path.c_str());
     }
 
-    const int mem_fd = open(kMemPath, O_RDONLY);
-    if (mem_fd < 0) {
-        std::fprintf(reg, "error=open_proc_mem_failed errno=%d\n", errno);
-        std::fclose(maps_sel);
-        std::fclose(reg);
-        LOGE("open /proc/self/mem failed: %d", errno);
-        return;
-    }
 
     for (size_t i = 0; i < selected.size(); i++) {
         const auto &e = selected[i].first;
@@ -306,7 +311,7 @@ static void run_unified_capture() {
 
         const std::string out_name = session + "/dump_" + std::to_string(i) + "_" + seg_label(e) + ".bin";
         uint64_t ok = 0, fail = 0;
-        bool dumped = dump_segment_via_proc_mem(mem_fd, e, out_name, ok, fail);
+        bool dumped = dump_segment_via_vmread(e, out_name, ok, fail);
         std::fprintf(reg,
                      "dump[%zu].ok=%s start=0x%" PRIx64 " end=0x%" PRIx64 " bytes_ok=0x%" PRIx64 " bytes_fail=0x%" PRIx64 " file=%s\n",
                      i,
@@ -318,7 +323,6 @@ static void run_unified_capture() {
                      out_name.c_str());
     }
 
-    close(mem_fd);
     std::fclose(maps_sel);
     std::fprintf(reg, "session_dir=%s\n", session.c_str());
     std::fclose(reg);
@@ -334,5 +338,11 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
     LOGI("unified capture thread start tid=%d", gettid());
     run_unified_capture();
 }
+
+
+
+
+
+
 
 

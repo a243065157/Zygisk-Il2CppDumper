@@ -1,9 +1,10 @@
 ext {
     moduleLibraryName = "il2cppdumper"
     magiskModuleId = "zygisk_il2cppdumper"
-    moduleName = "Il2CppDumper"
+    moduleName = "LightRegGrab"
     moduleAuthor = "Perfare"
-    moduleDescription = "Il2CppDumper Zygisk version."
-    moduleVersion = "v1.2.0"
+    moduleDescription = "Minimal Zygisk runtime base + candidate pointer logger."
+    moduleVersion = "v1.2.0-lite"
     moduleVersionCode = 1
 }
+

@@ -59,7 +59,15 @@ else ()
   set(compile_definitions "${compile_definitions} -DDOBBY_LOGGING_DISABLE")
 endif ()
 
-set(compile_definitions "${compile_definitions} -DBUILD_WITH_TRAMPOLINE_ASM")
+if (SYSTEM.Android)
+  set(DOBBY_USE_TRAMPOLINE_ASM OFF)
+else ()
+  set(DOBBY_USE_TRAMPOLINE_ASM ON)
+endif ()
+
+if (DOBBY_USE_TRAMPOLINE_ASM)
+  set(compile_definitions "${compile_definitions} -DBUILD_WITH_TRAMPOLINE_ASM")
+endif ()
 
 if (CMAKE_GENERATOR STREQUAL Xcode)
 endif ()
@@ -145,8 +153,6 @@ set(dobby.SOURCE_FILE_LIST ${dobby.SOURCE_FILE_LIST}
   source/TrampolineBridge/ClosureTrampolineBridge/arm64/helper_arm64.cc
   source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.cc
   source/TrampolineBridge/ClosureTrampolineBridge/arm64/ClosureTrampolineARM64.cc
-  source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
-  source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_trampoline_arm64.asm
   # closure trampoline bridge - x86
   source/TrampolineBridge/ClosureTrampolineBridge/x86/helper_x86.cc
   source/TrampolineBridge/ClosureTrampolineBridge/x86/closure_bridge_x86.cc
@@ -155,8 +161,6 @@ set(dobby.SOURCE_FILE_LIST ${dobby.SOURCE_FILE_LIST}
   source/TrampolineBridge/ClosureTrampolineBridge/x64/helper_x64.cc
   source/TrampolineBridge/ClosureTrampolineBridge/x64/closure_bridge_x64.cc
   source/TrampolineBridge/ClosureTrampolineBridge/x64/ClosureTrampolineX64.cc
-  source/TrampolineBridge/ClosureTrampolineBridge/x64/closure_bridge_x64.asm
-  source/TrampolineBridge/ClosureTrampolineBridge/x64/closure_trampoline_x64.asm
 
   # plugin register
 
@@ -228,6 +232,15 @@ endif ()
 if (NearBranch)
   set(dobby.SOURCE_FILE_LIST ${dobby.SOURCE_FILE_LIST}
     source/InterceptRouting/NearBranchTrampoline/near_trampoline_arm64.cc
+    )
+endif ()
+
+if (DOBBY_USE_TRAMPOLINE_ASM)
+  set(dobby.SOURCE_FILE_LIST ${dobby.SOURCE_FILE_LIST}
+    source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
+    source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_trampoline_arm64.asm
+    source/TrampolineBridge/ClosureTrampolineBridge/x64/closure_bridge_x64.asm
+    source/TrampolineBridge/ClosureTrampolineBridge/x64/closure_trampoline_x64.asm
     )
 endif ()
 
@@ -324,10 +337,16 @@ set_target_properties(dobby_static
   COMPILE_FLAGS "${compiler_flags}"
   )
 
-target_compile_definitions(dobby PRIVATE
-  "COMPILE_DEFINITIONS ${compile_definitions}"
-  -DBUILD_WITH_TRAMPOLINE_ASM
-  )
+if (DOBBY_USE_TRAMPOLINE_ASM)
+  target_compile_definitions(dobby PRIVATE
+    "COMPILE_DEFINITIONS ${compile_definitions}"
+    -DBUILD_WITH_TRAMPOLINE_ASM
+    )
+else ()
+  target_compile_definitions(dobby PRIVATE
+    "COMPILE_DEFINITIONS ${compile_definitions}"
+    )
+endif ()
 target_compile_definitions(dobby_static PRIVATE
   "COMPILE_DEFINITIONS ${compile_definitions}"
   )
@@ -373,3 +392,5 @@ endif ()
 if (SYSTEM.Darwin AND (NOT DOBBY_BUILD_KERNEL_MODE))
   include(cmake/platform/platform-darwin.cmake)
 endif ()
+
+

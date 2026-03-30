@@ -372,11 +372,6 @@ static void run_lua_dump_hook() {
     HookSpec specs[] = {
             {"luaL_loadbufferx", reinterpret_cast<void *>(hook_luaL_loadbufferx), reinterpret_cast<void **>(&g_orig_loadbufferx)},
             {"luaL_loadbuffer", reinterpret_cast<void *>(hook_luaL_loadbuffer), reinterpret_cast<void **>(&g_orig_loadbuffer)},
-            {"lua_load", reinterpret_cast<void *>(hook_lua_load), reinterpret_cast<void **>(&g_orig_load)},
-            {"lua_pcall", reinterpret_cast<void *>(hook_lua_pcall), reinterpret_cast<void **>(&g_orig_pcall)},
-            {"lua_pcallk", reinterpret_cast<void *>(hook_lua_pcallk), reinterpret_cast<void **>(&g_orig_pcallk)},
-            {"lua_settop", reinterpret_cast<void *>(hook_lua_settop), reinterpret_cast<void **>(&g_orig_settop)},
-            {"lua_gettop", reinterpret_cast<void *>(hook_lua_gettop), reinterpret_cast<void **>(&g_orig_gettop)},
     };
 
     write_status("lua hook wait start targets=libxlua.so,libil2cpp.so");
@@ -482,6 +477,7 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
     write_status(std::string("lua dump hook thread start pid=") + std::to_string(getpid()));
     run_lua_dump_hook();
 }
+
 
 
 

@@ -466,7 +466,7 @@ static void run_lua_dump_hook() {
 
     if (xdl_xlua) xdl_close(xdl_xlua);
     if (xdl_il2cpp) xdl_close(xdl_il2cpp);
-
+}
 
 } // namespace
 
@@ -482,6 +482,8 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
     write_status(std::string("lua dump hook thread start pid=") + std::to_string(getpid()));
     run_lua_dump_hook();
 }
+
+
 
 
 

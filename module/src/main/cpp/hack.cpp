@@ -281,18 +281,12 @@ static bool install_hook(void *sym, HookSpec &spec) {
         spec.engine = "dobby";
         spec.reason = "dobby_failed";
         spec.install_rc = rc;
+        return false;
     }
 
-    if (install_inline_hook(sym, spec.replacement, spec.original)) {
-        spec.engine = "inline";
-        spec.reason = "ok";
-        spec.install_rc = 0;
-        return true;
-    }
-
-    spec.engine = DobbyHook ? "dobby+inline" : "inline";
-    spec.reason = "install_failed";
-    if (spec.install_rc == -9999) spec.install_rc = -3;
+    spec.engine = "none";
+    spec.reason = "inline_disabled";
+    spec.install_rc = -2001;
     return false;
 }
 
@@ -477,6 +471,7 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
     write_status(std::string("lua dump hook thread start pid=") + std::to_string(getpid()));
     run_lua_dump_hook();
 }
+
 
 
 

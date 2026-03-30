@@ -21,6 +21,7 @@
 namespace {
 
 constexpr const char *kTargetSo = "libxlua.so";
+constexpr const char *kFallbackSo = "libil2cpp.so";
 constexpr const char *kOutDir = "/sdcard/Download/lua_dump";
 constexpr size_t kMaxDumpSize = 8 * 1024 * 1024;
 constexpr int kMaxWaitSec = 120;
@@ -55,21 +56,13 @@ static bool mkdirs(const std::string &path) {
 
 static std::string sanitize_name(const char *name, const char *fallback_prefix) {
     std::string out;
-    if (name && *name) {
-        out = name;
-    }
-    if (!out.empty() && out[0] == '@') {
-        out.erase(0, 1);
-    }
+    if (name && *name) out = name;
+    if (!out.empty() && out[0] == '@') out.erase(0, 1);
     for (char &c : out) {
-        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
-            c = '_';
-        }
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') c = '_';
         if (static_cast<unsigned char>(c) < 0x20) c = '_';
     }
-    if (out.empty()) {
-        out = std::string(fallback_prefix) + "_" + std::to_string(g_seq.fetch_add(1)) + ".lua";
-    }
+    if (out.empty()) out = std::string(fallback_prefix) + "_" + std::to_string(g_seq.fetch_add(1)) + ".lua";
     if (out.size() > 180) out.resize(180);
     return out;
 }
@@ -123,9 +116,8 @@ static bool make_writable_exec(void *addr, size_t len) {
 }
 
 static void write_abs_jump(void *from, void *to) {
-    // ldr x17, #8 ; br x17 ; .quad to
-    uint32_t insn1 = 0x58000051;
-    uint32_t insn2 = 0xD61F0220;
+    uint32_t insn1 = 0x58000051; // ldr x17, #8
+    uint32_t insn2 = 0xD61F0220; // br x17
     std::memcpy(from, &insn1, sizeof(insn1));
     std::memcpy(reinterpret_cast<uint8_t *>(from) + 4, &insn2, sizeof(insn2));
     std::memcpy(reinterpret_cast<uint8_t *>(from) + 8, &to, sizeof(to));
@@ -160,9 +152,7 @@ static bool install_inline_hook(void *target, void *replacement, void **original
 #else
 
 static bool install_inline_hook(void *target, void *replacement, void **original) {
-    (void) target;
-    (void) replacement;
-    (void) original;
+    (void) target; (void) replacement; (void) original;
     LOGE("inline hook only implemented for arm64");
     return false;
 }
@@ -171,23 +161,19 @@ static bool install_inline_hook(void *target, void *replacement, void **original
 
 static int hook_luaL_loadbufferx(void *L, const char *buff, size_t sz, const char *name, const char *mode) {
     write_chunk("luaL_loadbufferx", buff, sz, name);
-    if (g_orig_loadbufferx) {
-        return g_orig_loadbufferx(L, buff, sz, name, mode);
-    }
+    if (g_orig_loadbufferx) return g_orig_loadbufferx(L, buff, sz, name, mode);
     return 0;
 }
 
 static int hook_luaL_loadbuffer(void *L, const char *buff, size_t sz, const char *name) {
     write_chunk("luaL_loadbuffer", buff, sz, name);
-    if (g_orig_loadbuffer) {
-        return g_orig_loadbuffer(L, buff, sz, name);
-    }
+    if (g_orig_loadbuffer) return g_orig_loadbuffer(L, buff, sz, name);
     return 0;
 }
 
-static bool wait_for_xlua_loaded() {
+static bool wait_for_target_loaded(const char *so_name) {
     for (int i = 0; i < kMaxWaitSec * 2; i++) {
-        void *h = dlopen(kTargetSo, RTLD_NOW | RTLD_NOLOAD);
+        void *h = dlopen(so_name, RTLD_NOW | RTLD_NOLOAD);
         if (h) {
             dlclose(h);
             return true;
@@ -198,19 +184,38 @@ static bool wait_for_xlua_loaded() {
 }
 
 static void run_lua_dump_hook() {
-    if (!wait_for_xlua_loaded()) {
-        LOGE("wait libxlua.so timeout");
+    bool xlua_loaded = wait_for_target_loaded(kTargetSo);
+    bool il2cpp_loaded = wait_for_target_loaded(kFallbackSo);
+
+    if (!xlua_loaded && !il2cpp_loaded) {
+        LOGE("wait %s/%s timeout", kTargetSo, kFallbackSo);
         return;
     }
 
-    void *handle = dlopen(kTargetSo, RTLD_NOW);
-    if (!handle) {
-        LOGE("dlopen %s failed: %s", kTargetSo, dlerror());
-        return;
+    void *handle_xlua = nullptr;
+    void *handle_il2cpp = nullptr;
+    if (xlua_loaded) {
+        handle_xlua = dlopen(kTargetSo, RTLD_NOW);
+        if (!handle_xlua) LOGE("dlopen %s failed: %s", kTargetSo, dlerror());
+    }
+    if (il2cpp_loaded) {
+        handle_il2cpp = dlopen(kFallbackSo, RTLD_NOW);
+        if (!handle_il2cpp) LOGE("dlopen %s failed: %s", kFallbackSo, dlerror());
     }
 
-    void *sym_x = dlsym(handle, "luaL_loadbufferx");
-    void *sym = dlsym(handle, "luaL_loadbuffer");
+    void *sym_x = nullptr;
+    void *sym = nullptr;
+
+    if (handle_xlua) {
+        sym_x = dlsym(handle_xlua, "luaL_loadbufferx");
+        sym = dlsym(handle_xlua, "luaL_loadbuffer");
+    }
+    if (!sym_x && handle_il2cpp) {
+        sym_x = dlsym(handle_il2cpp, "luaL_loadbufferx");
+    }
+    if (!sym && handle_il2cpp) {
+        sym = dlsym(handle_il2cpp, "luaL_loadbuffer");
+    }
 
     bool ok = false;
 
@@ -224,7 +229,7 @@ static void run_lua_dump_hook() {
             LOGE("hook install failed: luaL_loadbufferx");
         }
     } else {
-        LOGE("symbol not found: luaL_loadbufferx");
+        LOGE("symbol not found: luaL_loadbufferx (in %s/%s)", kTargetSo, kFallbackSo);
     }
 
     if (sym) {
@@ -237,7 +242,7 @@ static void run_lua_dump_hook() {
             LOGE("hook install failed: luaL_loadbuffer");
         }
     } else {
-        LOGE("symbol not found: luaL_loadbuffer");
+        LOGE("symbol not found: luaL_loadbuffer (in %s/%s)", kTargetSo, kFallbackSo);
     }
 
     if (!ok) {

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include "xdl/include/xdl.h"
+#include "third_party/Dobby/include/dobby.h"
 #include <fcntl.h>
 #include <fstream>
 #include <string>
@@ -33,7 +34,7 @@ constexpr int kMaxNameRetries = 1000;
 using luaL_loadbufferx_t = int (*)(void *L, const char *buff, size_t sz, const char *name, const char *mode);
 using luaL_loadbuffer_t = int (*)(void *L, const char *buff, size_t sz, const char *name);
 
-extern "C" int DobbyHook(void *address, void *replace_call, void **origin_call) __attribute__((weak));
+
 extern "C" int xhook_register(const char *pathname_regex_str, const char *symbol, void *new_func, void **old_func) __attribute__((weak));
 extern "C" int xhook_refresh(int async) __attribute__((weak));
 
@@ -303,23 +304,17 @@ static bool install_hook(void *sym, HookSpec &spec) {
         return false;
     }
 
-    if (DobbyHook) {
-        const int rc = DobbyHook(sym, spec.replacement, spec.original);
-        if (rc == 0) {
-            spec.engine = "dobby";
-            spec.reason = "ok";
-            spec.install_rc = 0;
-            return true;
-        }
+    const int rc = DobbyHook(sym, spec.replacement, spec.original);
+    if (rc == 0) {
         spec.engine = "dobby";
-        spec.reason = "dobby_failed";
-        spec.install_rc = rc;
-        return false;
+        spec.reason = "ok";
+        spec.install_rc = 0;
+        return true;
     }
 
-    spec.engine = "none";
-    spec.reason = "inline_disabled";
-    spec.install_rc = -2001;
+    spec.engine = "dobby";
+    spec.reason = "dobby_failed";
+    spec.install_rc = rc;
     return false;
 }
 
@@ -466,5 +461,9 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
     write_status(std::string("lua dump hook thread start pid=") + std::to_string(getpid()));
     run_lua_dump_hook();
 }
+
+
+
+
 
 

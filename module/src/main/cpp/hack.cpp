@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -12,9 +11,9 @@
 #include <ctime>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <fstream>
 #include <string>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 
@@ -23,8 +22,9 @@ namespace {
 constexpr const char *kTargetSo = "libxlua.so";
 constexpr const char *kFallbackSo = "libil2cpp.so";
 constexpr const char *kOutDir = "/sdcard/Download/lua_dump";
+constexpr const char *kMapsPath = "/proc/self/maps";
 constexpr size_t kMaxDumpSize = 8 * 1024 * 1024;
-constexpr int kMaxWaitSec = 120;
+constexpr int kMaxWaitSec = 180;
 
 using luaL_loadbufferx_t = int (*)(void *L, const char *buff, size_t sz, const char *name, const char *mode);
 using luaL_loadbuffer_t = int (*)(void *L, const char *buff, size_t sz, const char *name);
@@ -34,6 +34,16 @@ luaL_loadbuffer_t g_orig_loadbuffer = nullptr;
 
 std::atomic<uint64_t> g_seq{0};
 thread_local bool g_in_dump = false;
+
+static bool maps_contains(const char *so_name) {
+    std::ifstream in(kMapsPath);
+    if (!in.is_open()) return false;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find(so_name) != std::string::npos) return true;
+    }
+    return false;
+}
 
 static bool mkdir_if_needed(const std::string &path) {
     if (path.empty()) return false;
@@ -116,8 +126,8 @@ static bool make_writable_exec(void *addr, size_t len) {
 }
 
 static void write_abs_jump(void *from, void *to) {
-    uint32_t insn1 = 0x58000051; // ldr x17, #8
-    uint32_t insn2 = 0xD61F0220; // br x17
+    uint32_t insn1 = 0x58000051;
+    uint32_t insn2 = 0xD61F0220;
     std::memcpy(from, &insn1, sizeof(insn1));
     std::memcpy(reinterpret_cast<uint8_t *>(from) + 4, &insn2, sizeof(insn2));
     std::memcpy(reinterpret_cast<uint8_t *>(from) + 8, &to, sizeof(to));
@@ -152,7 +162,9 @@ static bool install_inline_hook(void *target, void *replacement, void **original
 #else
 
 static bool install_inline_hook(void *target, void *replacement, void **original) {
-    (void) target; (void) replacement; (void) original;
+    (void) target;
+    (void) replacement;
+    (void) original;
     LOGE("inline hook only implemented for arm64");
     return false;
 }
@@ -171,83 +183,66 @@ static int hook_luaL_loadbuffer(void *L, const char *buff, size_t sz, const char
     return 0;
 }
 
-static bool wait_for_target_loaded(const char *so_name) {
-    for (int i = 0; i < kMaxWaitSec * 2; i++) {
-        void *h = dlopen(so_name, RTLD_NOW | RTLD_NOLOAD);
-        if (h) {
-            dlclose(h);
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-    return false;
-}
-
 static void run_lua_dump_hook() {
-    bool xlua_loaded = wait_for_target_loaded(kTargetSo);
-    bool il2cpp_loaded = wait_for_target_loaded(kFallbackSo);
-
-    if (!xlua_loaded && !il2cpp_loaded) {
-        LOGE("wait %s/%s timeout", kTargetSo, kFallbackSo);
-        return;
-    }
-
     void *handle_xlua = nullptr;
     void *handle_il2cpp = nullptr;
-    if (xlua_loaded) {
-        handle_xlua = dlopen(kTargetSo, RTLD_NOW);
-        if (!handle_xlua) LOGE("dlopen %s failed: %s", kTargetSo, dlerror());
-    }
-    if (il2cpp_loaded) {
-        handle_il2cpp = dlopen(kFallbackSo, RTLD_NOW);
-        if (!handle_il2cpp) LOGE("dlopen %s failed: %s", kFallbackSo, dlerror());
-    }
+    bool loadbufferx_installed = false;
+    bool loadbuffer_installed = false;
 
-    void *sym_x = nullptr;
-    void *sym = nullptr;
+    LOGI("lua hook wait start targets=%s,%s", kTargetSo, kFallbackSo);
 
-    if (handle_xlua) {
-        sym_x = dlsym(handle_xlua, "luaL_loadbufferx");
-        sym = dlsym(handle_xlua, "luaL_loadbuffer");
-    }
-    if (!sym_x && handle_il2cpp) {
-        sym_x = dlsym(handle_il2cpp, "luaL_loadbufferx");
-    }
-    if (!sym && handle_il2cpp) {
-        sym = dlsym(handle_il2cpp, "luaL_loadbuffer");
-    }
-
-    bool ok = false;
-
-    if (sym_x) {
-        void *orig = nullptr;
-        if (install_inline_hook(sym_x, reinterpret_cast<void *>(hook_luaL_loadbufferx), &orig)) {
-            g_orig_loadbufferx = reinterpret_cast<luaL_loadbufferx_t>(orig);
-            ok = true;
-            LOGI("hook installed: luaL_loadbufferx target=%p tramp=%p", sym_x, orig);
-        } else {
-            LOGE("hook install failed: luaL_loadbufferx");
+    for (int i = 0; i < kMaxWaitSec * 2; i++) {
+        if (!handle_xlua && maps_contains(kTargetSo)) {
+            handle_xlua = dlopen(kTargetSo, RTLD_NOW);
+            LOGI("target seen: %s handle=%p", kTargetSo, handle_xlua);
         }
-    } else {
-        LOGE("symbol not found: luaL_loadbufferx (in %s/%s)", kTargetSo, kFallbackSo);
-    }
 
-    if (sym) {
-        void *orig = nullptr;
-        if (install_inline_hook(sym, reinterpret_cast<void *>(hook_luaL_loadbuffer), &orig)) {
-            g_orig_loadbuffer = reinterpret_cast<luaL_loadbuffer_t>(orig);
-            ok = true;
-            LOGI("hook installed: luaL_loadbuffer target=%p tramp=%p", sym, orig);
-        } else {
-            LOGE("hook install failed: luaL_loadbuffer");
+        if (!handle_il2cpp && maps_contains(kFallbackSo)) {
+            handle_il2cpp = dlopen(kFallbackSo, RTLD_NOW);
+            LOGI("target seen: %s handle=%p", kFallbackSo, handle_il2cpp);
         }
-    } else {
-        LOGE("symbol not found: luaL_loadbuffer (in %s/%s)", kTargetSo, kFallbackSo);
+
+        if (!loadbufferx_installed) {
+            void *sym_x = nullptr;
+            if (handle_xlua) sym_x = dlsym(handle_xlua, "luaL_loadbufferx");
+            if (!sym_x && handle_il2cpp) sym_x = dlsym(handle_il2cpp, "luaL_loadbufferx");
+            if (sym_x) {
+                void *orig = nullptr;
+                if (install_inline_hook(sym_x, reinterpret_cast<void *>(hook_luaL_loadbufferx), &orig)) {
+                    g_orig_loadbufferx = reinterpret_cast<luaL_loadbufferx_t>(orig);
+                    loadbufferx_installed = true;
+                    LOGI("hook installed: luaL_loadbufferx target=%p tramp=%p", sym_x, orig);
+                } else {
+                    LOGE("hook install failed: luaL_loadbufferx");
+                }
+            }
+        }
+
+        if (!loadbuffer_installed) {
+            void *sym = nullptr;
+            if (handle_xlua) sym = dlsym(handle_xlua, "luaL_loadbuffer");
+            if (!sym && handle_il2cpp) sym = dlsym(handle_il2cpp, "luaL_loadbuffer");
+            if (sym) {
+                void *orig = nullptr;
+                if (install_inline_hook(sym, reinterpret_cast<void *>(hook_luaL_loadbuffer), &orig)) {
+                    g_orig_loadbuffer = reinterpret_cast<luaL_loadbuffer_t>(orig);
+                    loadbuffer_installed = true;
+                    LOGI("hook installed: luaL_loadbuffer target=%p tramp=%p", sym, orig);
+                } else {
+                    LOGE("hook install failed: luaL_loadbuffer");
+                }
+            }
+        }
+
+        if (loadbufferx_installed || loadbuffer_installed) {
+            LOGI("lua hook armed loadbufferx=%d loadbuffer=%d", loadbufferx_installed ? 1 : 0, loadbuffer_installed ? 1 : 0);
+            return;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    if (!ok) {
-        LOGE("no lua loadbuffer hook installed");
-    }
+    LOGE("lua hook timeout, no symbol found in %s/%s", kTargetSo, kFallbackSo);
 }
 
 } // namespace

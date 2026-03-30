@@ -13,7 +13,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <string>
-#include <sys/mman.h>
+#include <sys/mman.h>`r`n#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 
@@ -254,3 +254,4 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
     LOGI("lua dump hook thread start pid=%d", getpid());
     run_lua_dump_hook();
 }
+

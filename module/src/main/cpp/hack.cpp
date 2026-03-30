@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
 #include <dlfcn.h>
 #include "xdl/include/xdl.h"
 #include <fcntl.h>
@@ -28,14 +27,11 @@ constexpr const char *kMapsPath = "/proc/self/maps";
 constexpr const char *kProofPath = "/sdcard/Download/zygisk_alive.txt";
 constexpr size_t kMaxDumpSize = 8 * 1024 * 1024;
 constexpr int kMaxWaitSec = 180;
+constexpr int kMaxNameLen = 180;
+constexpr int kMaxNameRetries = 1000;
 
 using luaL_loadbufferx_t = int (*)(void *L, const char *buff, size_t sz, const char *name, const char *mode);
 using luaL_loadbuffer_t = int (*)(void *L, const char *buff, size_t sz, const char *name);
-using lua_load_t = int (*)(void *L, void *reader, void *data, const char *chunkname, const char *mode);
-using lua_pcall_t = int (*)(void *L, int nargs, int nresults, int errfunc);
-using lua_pcallk_t = int (*)(void *L, int nargs, int nresults, int errfunc, intptr_t ctx, void *k);
-using lua_settop_t = void (*)(void *L, int idx);
-using lua_gettop_t = int (*)(void *L);
 
 extern "C" int DobbyHook(void *address, void *replace_call, void **origin_call) __attribute__((weak));
 extern "C" int xhook_register(const char *pathname_regex_str, const char *symbol, void *new_func, void **old_func) __attribute__((weak));
@@ -43,11 +39,6 @@ extern "C" int xhook_refresh(int async) __attribute__((weak));
 
 luaL_loadbufferx_t g_orig_loadbufferx = nullptr;
 luaL_loadbuffer_t g_orig_loadbuffer = nullptr;
-lua_load_t g_orig_load = nullptr;
-lua_pcall_t g_orig_pcall = nullptr;
-lua_pcallk_t g_orig_pcallk = nullptr;
-lua_settop_t g_orig_settop = nullptr;
-lua_gettop_t g_orig_gettop = nullptr;
 
 std::atomic<uint64_t> g_seq{0};
 thread_local bool g_in_dump = false;
@@ -55,11 +46,6 @@ std::string g_app_data_dir;
 
 std::atomic<uint32_t> g_hit_loadbufferx{0};
 std::atomic<uint32_t> g_hit_loadbuffer{0};
-std::atomic<uint32_t> g_hit_load{0};
-std::atomic<uint32_t> g_hit_pcall{0};
-std::atomic<uint32_t> g_hit_pcallk{0};
-std::atomic<uint32_t> g_hit_settop{0};
-std::atomic<uint32_t> g_hit_gettop{0};
 
 struct HookSpec {
     const char *symbol;
@@ -72,6 +58,12 @@ struct HookSpec {
     int install_rc = -9999;
     const char *engine = "none";
     const char *reason = "not_attempted";
+};
+
+struct OutputFile {
+    int fd = -1;
+    std::string path;
+    std::string name;
 };
 
 static bool maps_contains(const char *so_name) {
@@ -117,16 +109,58 @@ static void write_status(const std::string &line) {
     }
 }
 
-static std::string sanitize_name(const char *name, const char *fallback_prefix) {
+static std::string sanitize_script_name(const char *name, const char *fallback_prefix) {
     std::string out;
     if (name && *name) out = name;
     if (!out.empty() && out[0] == '@') out.erase(0, 1);
+
     for (char &c : out) {
         if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') c = '_';
         if (static_cast<unsigned char>(c) < 0x20) c = '_';
     }
-    if (out.empty()) out = std::string(fallback_prefix) + "_" + std::to_string(g_seq.fetch_add(1)) + ".lua";
-    if (out.size() > 180) out.resize(180);
+
+    while (!out.empty() && (out.front() == '.' || out.front() == ' ')) out.erase(out.begin());
+    while (!out.empty() && (out.back() == ' ' || out.back() == '.')) out.pop_back();
+
+    if (out.empty()) {
+        out = std::string(fallback_prefix) + "_" + std::to_string(g_seq.fetch_add(1));
+    }
+
+    if (out.size() > static_cast<size_t>(kMaxNameLen)) out.resize(kMaxNameLen);
+
+    if (out.size() < 4 || out.substr(out.size() - 4) != ".lua") {
+        out += ".lua";
+    }
+
+    return out;
+}
+
+static OutputFile open_unique_output(const std::string &base_name) {
+    OutputFile out;
+    for (int i = 0; i < kMaxNameRetries; i++) {
+        std::string file_name = base_name;
+        if (i > 0) {
+            const size_t dot = base_name.rfind('.');
+            if (dot == std::string::npos) {
+                file_name = base_name + "_" + std::to_string(i);
+            } else {
+                file_name = base_name.substr(0, dot) + "_" + std::to_string(i) + base_name.substr(dot);
+            }
+        }
+
+        const std::string path = std::string(kOutDir) + "/" + file_name;
+        const int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0664);
+        if (fd >= 0) {
+            out.fd = fd;
+            out.path = path;
+            out.name = file_name;
+            return out;
+        }
+
+        if (errno != EEXIST) {
+            return out;
+        }
+    }
     return out;
 }
 
@@ -152,28 +186,27 @@ static void write_chunk(const char *api, const char *buff, size_t sz, const char
         return;
     }
 
-    const std::string file_name = sanitize_name(name, api);
-    const std::string out_path = std::string(kOutDir) + "/" + file_name;
-
-    int fd = open(out_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0664);
-    if (fd < 0) {
-        LOGE("lua_dump open failed: %s errno=%d", out_path.c_str(), errno);
+    const std::string base_name = sanitize_script_name(name, api);
+    OutputFile out = open_unique_output(base_name);
+    if (out.fd < 0) {
+        LOGE("lua_dump open failed base=%s errno=%d", base_name.c_str(), errno);
         write_status("lua_dump open failed errno=" + std::to_string(errno));
         g_in_dump = false;
         return;
     }
 
-    ssize_t wr = write(fd, buff, sz);
-    close(fd);
+    const ssize_t wr = write(out.fd, buff, sz);
+    close(out.fd);
+
     if (wr != static_cast<ssize_t>(sz)) {
-        LOGE("lua_dump write short: %s want=%zu got=%zd", out_path.c_str(), sz, wr);
+        LOGE("lua_dump write short: %s want=%zu got=%zd", out.path.c_str(), sz, wr);
         write_status("lua_dump write short");
         g_in_dump = false;
         return;
     }
 
-    LOGI("lua_dump ok api=%s size=%zu name=%s", api, sz, file_name.c_str());
-    write_status(std::string("lua_dump ok api=") + api + " size=" + std::to_string(sz) + " name=" + file_name);
+    LOGI("lua_dump ok api=%s size=%zu name=%s", api, sz, out.name.c_str());
+    write_status(std::string("lua_dump ok api=") + api + " size=" + std::to_string(sz) + " name=" + out.name);
     g_in_dump = false;
 }
 
@@ -245,9 +278,9 @@ static bool try_xhook(HookSpec &spec) {
         return false;
     }
 
-    int rc1 = xhook_register(".*libxlua\\\\.so$", spec.symbol, spec.replacement, spec.original);
-    int rc2 = xhook_register(".*libil2cpp\\\\.so$", spec.symbol, spec.replacement, spec.original);
-    int rc3 = xhook_refresh(0);
+    const int rc1 = xhook_register(".*libxlua\\\\.so$", spec.symbol, spec.replacement, spec.original);
+    const int rc2 = xhook_register(".*libil2cpp\\\\.so$", spec.symbol, spec.replacement, spec.original);
+    const int rc3 = xhook_refresh(0);
 
     if ((rc1 == 0 || rc2 == 0) && rc3 == 0) {
         spec.engine = "xhook";
@@ -271,7 +304,7 @@ static bool install_hook(void *sym, HookSpec &spec) {
     }
 
     if (DobbyHook) {
-        int rc = DobbyHook(sym, spec.replacement, spec.original);
+        const int rc = DobbyHook(sym, spec.replacement, spec.original);
         if (rc == 0) {
             spec.engine = "dobby";
             spec.reason = "ok";
@@ -281,12 +314,18 @@ static bool install_hook(void *sym, HookSpec &spec) {
         spec.engine = "dobby";
         spec.reason = "dobby_failed";
         spec.install_rc = rc;
-        return false;
     }
 
-    spec.engine = "none";
-    spec.reason = "inline_disabled";
-    spec.install_rc = -2001;
+    if (install_inline_hook(sym, spec.replacement, spec.original)) {
+        spec.engine = "inline";
+        spec.reason = "ok";
+        spec.install_rc = 0;
+        return true;
+    }
+
+    spec.engine = DobbyHook ? "dobby+inline" : "inline";
+    spec.reason = "install_failed";
+    if (spec.install_rc == -9999) spec.install_rc = -3;
     return false;
 }
 
@@ -304,42 +343,6 @@ static int hook_luaL_loadbuffer(void *L, const char *buff, size_t sz, const char
                std::string("size=") + std::to_string(sz) + " name=" + (name ? name : "<null>"), 6);
     write_chunk("luaL_loadbuffer", buff, sz, name);
     if (g_orig_loadbuffer) return g_orig_loadbuffer(L, buff, sz, name);
-    return 0;
-}
-
-static int hook_lua_load(void *L, void *reader, void *data, const char *chunkname, const char *mode) {
-    record_hit("lua_load", g_hit_load,
-               std::string("reader=") + std::to_string(reinterpret_cast<uintptr_t>(reader)) +
-               " chunk=" + (chunkname ? chunkname : "<null>") +
-               " mode=" + (mode ? mode : "<null>"), 8);
-    if (g_orig_load) return g_orig_load(L, reader, data, chunkname, mode);
-    return 0;
-}
-
-static int hook_lua_pcall(void *L, int nargs, int nresults, int errfunc) {
-    record_hit("lua_pcall", g_hit_pcall,
-               "nargs=" + std::to_string(nargs) + " nresults=" + std::to_string(nresults) + " err=" + std::to_string(errfunc), 8);
-    if (g_orig_pcall) return g_orig_pcall(L, nargs, nresults, errfunc);
-    return 0;
-}
-
-static int hook_lua_pcallk(void *L, int nargs, int nresults, int errfunc, intptr_t ctx, void *k) {
-    record_hit("lua_pcallk", g_hit_pcallk,
-               "nargs=" + std::to_string(nargs) + " nresults=" + std::to_string(nresults) +
-               " err=" + std::to_string(errfunc) + " ctx=" + std::to_string(static_cast<long long>(ctx)) +
-               " k=" + std::to_string(reinterpret_cast<uintptr_t>(k)), 8);
-    if (g_orig_pcallk) return g_orig_pcallk(L, nargs, nresults, errfunc, ctx, k);
-    return 0;
-}
-
-static void hook_lua_settop(void *L, int idx) {
-    record_hit("lua_settop", g_hit_settop, "idx=" + std::to_string(idx), 4);
-    if (g_orig_settop) g_orig_settop(L, idx);
-}
-
-static int hook_lua_gettop(void *L) {
-    record_hit("lua_gettop", g_hit_gettop, "", 4);
-    if (g_orig_gettop) return g_orig_gettop(L);
     return 0;
 }
 
@@ -366,6 +369,11 @@ static void run_lua_dump_hook() {
     HookSpec specs[] = {
             {"luaL_loadbufferx", reinterpret_cast<void *>(hook_luaL_loadbufferx), reinterpret_cast<void **>(&g_orig_loadbufferx)},
             {"luaL_loadbuffer", reinterpret_cast<void *>(hook_luaL_loadbuffer), reinterpret_cast<void **>(&g_orig_loadbuffer)},
+    };
+
+    const auto cleanup = [&]() {
+        if (xdl_xlua) xdl_close(xdl_xlua);
+        if (xdl_il2cpp) xdl_close(xdl_il2cpp);
     };
 
     write_status("lua hook wait start targets=libxlua.so,libil2cpp.so");
@@ -421,25 +429,22 @@ static void run_lua_dump_hook() {
             if (!sym && handle_il2cpp) sym = dlsym(handle_il2cpp, spec.symbol);
             if (!sym) sym = dlsym(RTLD_DEFAULT, spec.symbol);
 
-            if (!sym) {
-                continue;
-            }
+            if (!sym) continue;
 
             spec.symbol_found = true;
             spec.symbol_addr = reinterpret_cast<uintptr_t>(sym);
             if (install_hook(sym, spec)) {
                 spec.installed = true;
                 installed_count++;
-                const std::string ok = std::string("hook installed: ") + spec.symbol +
-                                       " engine=" + spec.engine +
-                                       " target=" + std::to_string(reinterpret_cast<uintptr_t>(sym));
-                LOGI("%s", ok.c_str());
-                write_status(ok);
+                write_status(std::string("hook installed: ") + spec.symbol +
+                             " engine=" + spec.engine +
+                             " target=" + std::to_string(reinterpret_cast<uintptr_t>(sym)));
             }
         }
 
         if (installed_count == static_cast<int>(sizeof(specs) / sizeof(specs[0]))) {
             write_status("lua hook armed: all targets installed");
+            cleanup();
             return;
         }
 
@@ -448,13 +453,8 @@ static void run_lua_dump_hook() {
 
     LOGE("lua hook timeout, symbol install not complete");
     write_status("lua hook timeout, symbol install not complete");
-
-    for (const auto &spec : specs) {
-        report_final_status(spec);
-    }
-
-    if (xdl_xlua) xdl_close(xdl_xlua);
-    if (xdl_il2cpp) xdl_close(xdl_il2cpp);
+    for (const auto &spec : specs) report_final_status(spec);
+    cleanup();
 }
 
 } // namespace
@@ -467,19 +467,8 @@ void hack_prepare(const char *game_data_dir, void *data, size_t length) {
     } else {
         g_app_data_dir.clear();
     }
+
     LOGI("lua dump hook thread start pid=%d", getpid());
     write_status(std::string("lua dump hook thread start pid=") + std::to_string(getpid()));
     run_lua_dump_hook();
 }
-
-
-
-
-
-
-
-
-
-
-
-
